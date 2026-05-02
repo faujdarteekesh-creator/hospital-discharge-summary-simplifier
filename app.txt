@@ -1,0 +1,606 @@
+import { useState, useRef } from "react";
+
+const SECTIONS = [
+  { key: "patient",      label: "Patient Info",    icon: "👤", color: "#a78bfa" },
+  { key: "diagnosis",    label: "Diagnosis",       icon: "🩺", color: "#38bdf8" },
+  { key: "medications",  label: "Medications",     icon: "💊", color: "#34d399" },
+  { key: "instructions", label: "Care & Activity", icon: "📋", color: "#fbbf24" },
+  { key: "followup",     label: "Follow-up",       icon: "📅", color: "#f472b6" },
+  { key: "warnings",     label: "Warning Signs",   icon: "⚠️", color: "#fb923c" },
+];
+
+const KEYWORD_MAP = {
+  patient:      ["patient:", "patient name", "dob:", "mrn:", "age:", "admission:", "discharge:", "gender:", "sex:", "ward", "bed no", "room"],
+  diagnosis:    ["diagnosis", "diagnos", "condition", "disease", "disorder", "impression", "assessment", "presenting", "primary", "secondary", "ejection", "fracture", "infection", "syndrome"],
+  medications:  ["medication", "medicine", "drug", "tablet", "capsule", " mg", " ml", "dose", "prescription", "rx", "furosemide", "aspirin", "metformin", "warfarin", "lisinopril", "metoprolol", "spironolactone", "antibiotic", "insulin", "inject"],
+  instructions: ["activity", "diet", "restrict", "avoid", "sodium", "fluid", "exercise", "rehab", "wound", "limit", "no strenuous", "care", "dressing", "bath", "hygiene", "rest", "walk"],
+  followup:     ["follow", "appointment", "clinic", "visit", "refer", "schedule", "return", "pcp", "cardiolog", "specialist", "inr check", "week", " days", "review", "outpatient"],
+  warnings:     ["warning", "emergency", "call", "danger", "alert", "seek", "urgent", "immediately", "if you", "watch for", "fever", "bleeding", "chest pain", "shortness", "sign", "vomit", "swelling", "dizz"],
+};
+
+function parseSummary(text) {
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+  const result = { patient: [], diagnosis: [], medications: [], instructions: [], followup: [], warnings: [] };
+  lines.forEach(line => {
+    const lower = line.toLowerCase();
+    let placed = false;
+    for (const [section, keywords] of Object.entries(KEYWORD_MAP)) {
+      if (keywords.some(k => lower.includes(k))) {
+        result[section].push(line);
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) result.instructions.push(line);
+  });
+  for (const key of Object.keys(result)) result[key] = [...new Set(result[key])];
+  return result;
+}
+
+function cleanLine(line) { return line.replace(/^[-•*]\s*/, "").trim(); }
+
+function speak(text, lang = "en") {
+  if (!window.speechSynthesis) return;
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = lang === "Hindi" ? "hi-IN" : "en-US";
+  u.rate = 0.9;
+  window.speechSynthesis.speak(u);
+}
+function stopSpeaking() { if (window.speechSynthesis) window.speechSynthesis.cancel(); }
+
+// ── Claude API call (text) ────────────────────────────────────────
+async function callClaude(system, userText) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      system,
+      messages: [{ role: "user", content: userText }],
+    }),
+  });
+  const data = await res.json();
+  return data.content?.[0]?.text || "";
+}
+
+// ── Claude Vision: extract text from image ────────────────────────
+async function extractTextFromImage(base64, mediaType) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      system: "You are a medical document OCR assistant. Extract ALL text from the image exactly as it appears. Preserve line breaks and formatting. Output only the extracted text, nothing else.",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: mediaType, data: base64 } },
+          { type: "text", text: "Extract all text from this hospital discharge summary document." }
+        ]
+      }],
+    }),
+  });
+  const data = await res.json();
+  return data.content?.[0]?.text || "";
+}
+
+async function explainTerm(term, language) {
+  const langNote = language === "Hindi"
+    ? "Respond entirely in simple Hindi (Devanagari). Use everyday Hindi words."
+    : "Respond in simple English a non-medical person can understand.";
+  return callClaude(
+    `You are a friendly medical explainer. ${langNote} Explain in 3-4 simple sentences. Use an analogy if helpful. Be warm. No jargon.`,
+    `Explain this medical term simply: "${term}"`
+  );
+}
+
+const sampleText = `DISCHARGE SUMMARY
+Patient: John Doe | DOB: 1958-03-14 | MRN: 7842910
+Gender: Male | Age: 68 | Ward: Cardiology | Bed No: 12
+Admission: 2026-04-18 | Discharge: 2026-04-24
+
+PRIMARY DIAGNOSIS: Acute decompensated heart failure (ADHF) with reduced ejection fraction (EF 30%), NYHA Class III.
+SECONDARY DIAGNOSES: Hypertensive nephrosclerosis, Type 2 Diabetes Mellitus (HbA1c 8.2%), Atrial fibrillation (rate-controlled).
+
+DISCHARGE MEDICATIONS:
+- Furosemide 40mg PO BID (twice daily)
+- Metoprolol succinate 100mg PO daily
+- Lisinopril 10mg PO daily
+- Warfarin 5mg PO daily (INR goal 2-3)
+- Aspirin 81mg PO daily
+
+FOLLOW-UP: Cardiology clinic in 7 days. PCP within 2 weeks. INR check in 3 days.
+ACTIVITY: Restrict sodium less than 2g per day. No strenuous activity for 4 weeks.
+WARNING SIGNS: Call doctor if fever above 101F, chest pain, shortness of breath, or unusual bleeding.`;
+
+// ── AI Explain Panel ──────────────────────────────────────────────
+function ExplainPanel({ initialTerm = "", onClose }) {
+  const [term, setTerm]         = useState(initialTerm);
+  const [language, setLanguage] = useState("Simple English");
+  const [loading, setLoading]   = useState(false);
+  const [result, setResult]     = useState("");
+  const [history, setHistory]   = useState([]);
+  const [speaking, setSpeaking] = useState(false);
+
+  async function handleExplain(t = term) {
+    if (!t.trim()) return;
+    setTerm(t); setLoading(true); setResult(""); stopSpeaking(); setSpeaking(false);
+    const explanation = await explainTerm(t.trim(), language);
+    setResult(explanation);
+    setHistory(h => [{ term: t.trim(), explanation, language }, ...h].slice(0, 5));
+    setLoading(false);
+  }
+
+  function handleSpeak() {
+    if (speaking) { stopSpeaking(); setSpeaking(false); }
+    else {
+      speak(result, language); setSpeaking(true);
+      setTimeout(() => setSpeaking(false), result.split(" ").length * 500);
+    }
+  }
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 1000, background: "rgba(0,0,0,0.5)", backdropFilter: "blur(4px)", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div style={{ background: "#fff", borderRadius: 22, width: "100%", maxWidth: 540, boxShadow: "0 24px 64px rgba(0,0,0,0.25)", overflow: "hidden", maxHeight: "90vh", display: "flex", flexDirection: "column" }}>
+        <div style={{ background: "linear-gradient(135deg,#1e3a5f,#4c1d95)", padding: "20px 24px", display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ width: 42, height: 42, borderRadius: 12, background: "linear-gradient(135deg,#7c3aed,#2563eb)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20 }}>🤖</div>
+          <div style={{ flex: 1 }}>
+            <h2 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: "#e0f2fe" }}>AI Medical Explainer</h2>
+            <p style={{ margin: 0, fontSize: 12, color: "#c4b5fd" }}>Type karo + 🔊 suno</p>
+          </div>
+          <button onClick={() => { stopSpeaking(); onClose(); }} style={{ background: "rgba(255,255,255,0.15)", border: "none", color: "#e0f2fe", borderRadius: 8, width: 32, height: 32, cursor: "pointer", fontSize: 16 }}>✕</button>
+        </div>
+
+        <div style={{ padding: "18px 22px", overflowY: "auto", flex: 1 }}>
+          <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+            {["Simple English", "Hindi"].map(lang => (
+              <button key={lang} onClick={() => setLanguage(lang)} style={{ padding: "6px 14px", borderRadius: 20, border: "none", cursor: "pointer", fontSize: 13, fontFamily: "inherit", fontWeight: 600, background: language === lang ? "#7c3aed" : "#f1f5f9", color: language === lang ? "#fff" : "#64748b" }}>
+                {lang === "Hindi" ? "🇮🇳 Hindi" : "🇬🇧 English"}
+              </button>
+            ))}
+          </div>
+
+          <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+            <input value={term} onChange={e => setTerm(e.target.value)} onKeyDown={e => e.key === "Enter" && !loading && handleExplain()}
+              placeholder='e.g. "Ejection Fraction", "BID", "INR"...'
+              style={{ flex: 1, padding: "9px 13px", border: "1.5px solid #e2e8f0", borderRadius: 10, fontSize: 14, fontFamily: "inherit", outline: "none", color: "#334155", background: "#f8fafc" }} />
+            <button onClick={() => handleExplain()} disabled={loading || !term.trim()} style={{ padding: "9px 16px", background: loading ? "#94a3b8" : "linear-gradient(135deg,#7c3aed,#2563eb)", border: "none", borderRadius: 10, color: "#fff", fontSize: 14, cursor: loading ? "not-allowed" : "pointer", fontFamily: "inherit", fontWeight: 700 }}>
+              {loading ? "⟳" : "Go →"}
+            </button>
+          </div>
+
+          <div style={{ marginBottom: 14 }}>
+            <p style={{ margin: "0 0 7px", fontSize: 11, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.06em" }}>Quick Terms</p>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+              {["Ejection Fraction", "NYHA Class III", "BID", "INR", "Dyspnea", "Edema", "HbA1c", "Atrial Fibrillation", "BNP", "Diuresis"].map(t => (
+                <button key={t} onClick={() => handleExplain(t)} style={{ padding: "3px 11px", borderRadius: 14, border: "1px solid #e2e8f0", background: "#f8fafc", color: "#475569", fontSize: 12, cursor: "pointer", fontFamily: "inherit" }}
+                  onMouseEnter={e => { e.currentTarget.style.background = "#ede9fe"; e.currentTarget.style.color = "#7c3aed"; }}
+                  onMouseLeave={e => { e.currentTarget.style.background = "#f8fafc"; e.currentTarget.style.color = "#475569"; }}>
+                  {t}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {loading && (
+            <div style={{ textAlign: "center", padding: "24px", color: "#94a3b8" }}>
+              <div style={{ fontSize: 28, display: "inline-block", animation: "spin 1s linear infinite" }}>⟳</div>
+              <p style={{ margin: "8px 0 0", fontSize: 13 }}>AI samjha raha hai...</p>
+            </div>
+          )}
+
+          {result && !loading && (
+            <div style={{ background: "linear-gradient(135deg,#f5f3ff,#eff6ff)", border: "1.5px solid #c4b5fd", borderRadius: 14, padding: "14px 16px", marginBottom: 14 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8, gap: 8 }}>
+                <span style={{ fontSize: 13, fontWeight: 700, color: "#5b21b6" }}>🤖 "{term}" ka matlab:</span>
+                <button onClick={handleSpeak} style={{ padding: "5px 12px", borderRadius: 16, border: "none", cursor: "pointer", background: speaking ? "#fef2f2" : "#ede9fe", color: speaking ? "#dc2626" : "#7c3aed", fontSize: 12, fontWeight: 700, fontFamily: "inherit" }}>
+                  {speaking ? "⏹ Stop" : "🔊 Suno"}
+                </button>
+              </div>
+              <p style={{ margin: 0, fontSize: 14, color: "#334155", lineHeight: 1.85, whiteSpace: "pre-wrap" }}>{result}</p>
+            </div>
+          )}
+
+          {history.length > 1 && (
+            <div>
+              <p style={{ margin: "0 0 7px", fontSize: 11, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.06em" }}>Recent</p>
+              {history.slice(1).map((h, i) => (
+                <div key={i} onClick={() => { setTerm(h.term); setResult(h.explanation); setLanguage(h.language); }}
+                  style={{ padding: "8px 13px", border: "1px solid #e2e8f0", borderRadius: 10, marginBottom: 6, cursor: "pointer", background: "#f8fafc" }}
+                  onMouseEnter={e => e.currentTarget.style.background = "#f5f3ff"}
+                  onMouseLeave={e => e.currentTarget.style.background = "#f8fafc"}>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: "#7c3aed" }}>{h.term}</span>
+                  <p style={{ margin: "3px 0 0", fontSize: 12, color: "#64748b", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}>{h.explanation}</p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <div style={{ padding: "10px 22px", background: "#faf5ff", borderTop: "1px solid #ede9fe", fontSize: 11, color: "#94a3b8", fontStyle: "italic" }}>
+          ⚠️ For understanding only — always consult your doctor
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────
+export default function App() {
+  const [rawText, setRawText]       = useState("");
+  const [results, setResults]       = useState(null);
+  const [activeTab, setActiveTab]   = useState("patient");
+  const [search, setSearch]         = useState("");
+  const [copied, setCopied]         = useState(false);
+  const [error, setError]           = useState("");
+  const [showAI, setShowAI]         = useState(false);
+  const [selectedTerm, setSelectedTerm] = useState("");
+
+  // Image states
+  const [imgPreview, setImgPreview] = useState(null);
+  const [imgBase64, setImgBase64]   = useState(null);
+  const [imgType, setImgType]       = useState(null);
+  const [ocrLoading, setOcrLoading] = useState(false);
+  const [ocrError, setOcrError]     = useState("");
+  const [inputMode, setInputMode]   = useState("text"); // "text" | "image"
+  const fileRef = useRef();
+
+  function handleParse() {
+    if (!rawText.trim()) { setError("Please paste a discharge summary first."); return; }
+    setError("");
+    setResults(parseSummary(rawText));
+    setActiveTab("patient");
+  }
+
+  function copyAll() {
+    if (!results) return;
+    const text = SECTIONS.map(s => `${s.label.toUpperCase()}\n${results[s.key].join("\n") || "No info."}`).join("\n\n");
+    navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }
+
+  function handlePrint() {
+    if (!results) return;
+    const html = `<html><head><title>Discharge Summary</title><style>body{font-family:Georgia,serif;max-width:700px;margin:40px auto;color:#111;line-height:1.7}h1{font-size:22px;border-bottom:2px solid #3b82f6;padding-bottom:8px}h2{font-size:16px;margin-top:28px;color:#1e40af}.line{background:#f0f7ff;border-left:4px solid #3b82f6;padding:8px 14px;margin:6px 0;border-radius:4px;font-size:14px}.warn{border-left-color:#f59e0b;background:#fffbeb}footer{margin-top:40px;font-size:11px;color:#888;border-top:1px solid #ddd;padding-top:10px}</style></head><body>
+    <h1>🏥 Discharge Summary — Simplified</h1>
+    ${SECTIONS.map(s => `<h2>${s.icon} ${s.label}</h2>${results[s.key].length ? results[s.key].map(l => `<div class="line ${s.key === "warnings" ? "warn" : ""}">${cleanLine(l)}</div>`).join("") : "<div class='line'>No info.</div>"}`).join("")}
+    <footer>Printed from Discharge Summary Simplifier · Always consult your doctor</footer></body></html>`;
+    const w = window.open("", "_blank"); w.document.write(html); w.document.close(); w.print();
+  }
+
+  // ── Image Upload & OCR ──────────────────────────────────────────
+  function handleImageSelect(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) { setOcrError("Please upload an image file (JPG, PNG, etc.)"); return; }
+    setOcrError("");
+    setImgType(file.type);
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const dataUrl = ev.target.result;
+      setImgPreview(dataUrl);
+      setImgBase64(dataUrl.split(",")[1]);
+    };
+    reader.readAsDataURL(file);
+  }
+
+  async function handleOCR() {
+    if (!imgBase64) return;
+    setOcrLoading(true);
+    setOcrError("");
+    try {
+      const extracted = await extractTextFromImage(imgBase64, imgType);
+      if (!extracted.trim()) { setOcrError("Could not extract text. Try a clearer image."); setOcrLoading(false); return; }
+      setRawText(extracted);
+      setInputMode("text");
+      setResults(null);
+    } catch {
+      setOcrError("Image read failed. Please try again.");
+    }
+    setOcrLoading(false);
+  }
+
+  function clearImage() { setImgPreview(null); setImgBase64(null); setImgType(null); setOcrError(""); if (fileRef.current) fileRef.current.value = ""; }
+
+  const totalLines    = results ? Object.values(results).flat().length : 0;
+  const activeSection = SECTIONS.find(s => s.key === activeTab);
+  const activeLines   = results?.[activeTab] || [];
+  const filteredLines = search.trim() ? activeLines.filter(l => l.toLowerCase().includes(search.toLowerCase())) : activeLines;
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#f0f4f8", fontFamily: "'Palatino Linotype','Book Antiqua',Palatino,Georgia,serif", color: "#1a202c" }}>
+
+      {showAI && <ExplainPanel initialTerm={selectedTerm} onClose={() => { setShowAI(false); setSelectedTerm(""); }} />}
+
+      {/* Header */}
+      <div style={{ background: "linear-gradient(135deg,#1e3a5f,#0f2544,#1a3a5c)", position: "relative", overflow: "hidden" }}>
+        <div style={{ position: "absolute", top: -40, right: -40, width: 180, height: 180, borderRadius: "50%", background: "rgba(59,130,246,0.08)", pointerEvents: "none" }} />
+        <div style={{ maxWidth: 1050, margin: "0 auto", padding: "24px 28px 20px", display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+          <div style={{ width: 52, height: 52, borderRadius: 16, background: "linear-gradient(135deg,#3b82f6,#06b6d4)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 26, boxShadow: "0 6px 20px rgba(59,130,246,0.45)", flexShrink: 0 }}>🏥</div>
+          <div style={{ flex: 1 }}>
+            <h1 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: "#e0f2fe" }}>Discharge Summary Simplifier</h1>
+            <p style={{ margin: "2px 0 0", fontSize: 12, color: "#7dd3fc", fontStyle: "italic" }}>Paste text or upload image → organized sections + AI explainer 🔊</p>
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            {results && (
+              <>
+                <StatBadge label="Sections" value={SECTIONS.filter(s => results[s.key].length > 0).length} color="#38bdf8" />
+                <StatBadge label="Lines" value={totalLines} color="#34d399" />
+              </>
+            )}
+            <button onClick={() => { setSelectedTerm(""); setShowAI(true); }} style={{ padding: "9px 16px", background: "linear-gradient(135deg,#7c3aed,#2563eb)", border: "none", borderRadius: 12, color: "#fff", fontSize: 13, cursor: "pointer", fontFamily: "inherit", fontWeight: 700, boxShadow: "0 4px 14px rgba(124,58,237,0.4)" }}>
+              🤖 AI Explainer
+            </button>
+          </div>
+        </div>
+        {results && (
+          <div style={{ maxWidth: 1050, margin: "0 auto", padding: "0 28px 16px", display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {SECTIONS.map(s => (
+              <button key={s.key} onClick={() => setActiveTab(s.key)} style={{ padding: "4px 13px", borderRadius: 20, border: "none", cursor: "pointer", fontSize: 12, fontFamily: "inherit", fontWeight: 600, background: activeTab === s.key ? s.color : "rgba(255,255,255,0.12)", color: activeTab === s.key ? "#fff" : "rgba(255,255,255,0.65)", boxShadow: activeTab === s.key ? `0 2px 10px ${s.color}66` : "none" }}>
+                {s.icon} {s.label} ({results[s.key].length})
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div style={{ maxWidth: 1050, margin: "0 auto", padding: "26px 22px" }}>
+
+        {/* Input Card */}
+        <div style={{ background: "#fff", borderRadius: 18, boxShadow: "0 4px 24px rgba(0,0,0,0.08)", padding: 26, marginBottom: 22, border: "1px solid #e2e8f0" }}>
+
+          {/* Mode Toggle */}
+          <div style={{ display: "flex", gap: 0, marginBottom: 18, background: "#f1f5f9", borderRadius: 12, padding: 4, width: "fit-content" }}>
+            {[{ id: "text", label: "📝 Paste Text" }, { id: "image", label: "📷 Upload Image" }].map(m => (
+              <button key={m.id} onClick={() => setInputMode(m.id)} style={{
+                padding: "8px 20px", borderRadius: 9, border: "none", cursor: "pointer", fontSize: 13,
+                fontFamily: "inherit", fontWeight: 600, transition: "all 0.18s",
+                background: inputMode === m.id ? "#fff" : "transparent",
+                color: inputMode === m.id ? "#1e40af" : "#94a3b8",
+                boxShadow: inputMode === m.id ? "0 2px 8px rgba(0,0,0,0.1)" : "none",
+              }}>{m.label}</button>
+            ))}
+          </div>
+
+          {/* TEXT MODE */}
+          {inputMode === "text" && (
+            <>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
+                <div>
+                  <h2 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: "#1e40af", textTransform: "uppercase", letterSpacing: "0.04em" }}>Paste Discharge Summary</h2>
+                  <p style={{ margin: "2px 0 0", fontSize: 12, color: "#94a3b8" }}>Any format — typed or copied from hospital documents</p>
+                </div>
+                <button onClick={() => { setRawText(sampleText); setResults(null); setError(""); }} style={{ background: "#eff6ff", border: "1px solid #bfdbfe", color: "#2563eb", borderRadius: 10, padding: "6px 14px", fontSize: 13, cursor: "pointer", fontFamily: "inherit", fontWeight: 600 }}>
+                  Load Sample ↗
+                </button>
+              </div>
+              <textarea value={rawText} onChange={e => { setRawText(e.target.value); setError(""); }}
+                placeholder="Paste the hospital discharge summary here..."
+                style={{ width: "100%", height: 200, background: "#f8fafc", border: "1.5px solid #e2e8f0", borderRadius: 12, color: "#334155", padding: "13px 15px", fontSize: 13, fontFamily: "monospace", resize: "vertical", outline: "none", lineHeight: 1.7, boxSizing: "border-box" }} />
+              {error && <div style={{ marginTop: 10, padding: "9px 14px", background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 8, color: "#dc2626", fontSize: 13 }}>⚠️ {error}</div>}
+              <div style={{ display: "flex", alignItems: "center", marginTop: 13, gap: 10, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 12, color: "#94a3b8" }}>{rawText.trim().split("\n").filter(Boolean).length} lines · {rawText.length} chars</span>
+                <div style={{ display: "flex", gap: 8, marginLeft: "auto" }}>
+                  {rawText && <button onClick={() => { setRawText(""); setResults(null); setError(""); }} style={{ padding: "8px 16px", background: "#fef2f2", border: "1px solid #fecaca", color: "#dc2626", borderRadius: 10, cursor: "pointer", fontSize: 13, fontFamily: "inherit", fontWeight: 600 }}>✕ Clear</button>}
+                  <button onClick={handleParse} style={{ padding: "8px 24px", background: "linear-gradient(135deg,#2563eb,#0891b2)", border: "none", borderRadius: 10, color: "#fff", fontSize: 14, cursor: "pointer", fontFamily: "inherit", fontWeight: 700, boxShadow: "0 4px 14px rgba(37,99,235,0.35)" }}>
+                    🔍 Parse & Simplify
+                  </button>
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* IMAGE MODE */}
+          {inputMode === "image" && (
+            <div>
+              <h2 style={{ margin: "0 0 4px", fontSize: 14, fontWeight: 700, color: "#1e40af", textTransform: "uppercase", letterSpacing: "0.04em" }}>Upload Discharge Summary Image</h2>
+              <p style={{ margin: "0 0 16px", fontSize: 12, color: "#94a3b8" }}>JPG, PNG — AI will read the text automatically using vision</p>
+
+              {/* Drop Zone */}
+              {!imgPreview ? (
+                <div>
+                  {/* Two buttons: Gallery + Camera */}
+                  <div style={{ display: "flex", gap: 12, marginBottom: 14, flexWrap: "wrap" }}>
+                    {/* Gallery/File picker */}
+                    <label style={{
+                      flex: 1, minWidth: 140, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+                      gap: 8, padding: "28px 16px", border: "2px dashed #bfdbfe", borderRadius: 14,
+                      cursor: "pointer", background: "#eff6ff", transition: "all 0.2s", textAlign: "center",
+                    }}
+                      onMouseEnter={e => e.currentTarget.style.background = "#dbeafe"}
+                      onMouseLeave={e => e.currentTarget.style.background = "#eff6ff"}>
+                      <span style={{ fontSize: 36 }}>🖼️</span>
+                      <span style={{ fontSize: 14, fontWeight: 700, color: "#1e40af" }}>Gallery se Upload</span>
+                      <span style={{ fontSize: 12, color: "#94a3b8" }}>JPG, PNG select karo</span>
+                      <input type="file" accept="image/*" onChange={handleImageSelect} style={{ display: "none" }} />
+                    </label>
+
+                    {/* Camera */}
+                    <label style={{
+                      flex: 1, minWidth: 140, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+                      gap: 8, padding: "28px 16px", border: "2px dashed #bbf7d0", borderRadius: 14,
+                      cursor: "pointer", background: "#f0fdf4", transition: "all 0.2s", textAlign: "center",
+                    }}
+                      onMouseEnter={e => e.currentTarget.style.background = "#dcfce7"}
+                      onMouseLeave={e => e.currentTarget.style.background = "#f0fdf4"}>
+                      <span style={{ fontSize: 36 }}>📸</span>
+                      <span style={{ fontSize: 14, fontWeight: 700, color: "#059669" }}>Camera se Photo Lo</span>
+                      <span style={{ fontSize: 12, color: "#94a3b8" }}>Live camera open hoga</span>
+                      <input type="file" accept="image/*" capture="environment" onChange={handleImageSelect} style={{ display: "none" }} />
+                    </label>
+                  </div>
+
+                  {/* Drag drop zone */}
+                  <div
+                    onDragOver={e => { e.preventDefault(); e.currentTarget.style.borderColor = "#3b82f6"; e.currentTarget.style.background = "#eff6ff"; }}
+                    onDragLeave={e => { e.currentTarget.style.borderColor = "#e2e8f0"; e.currentTarget.style.background = "#f8fafc"; }}
+                    onDrop={e => {
+                      e.preventDefault();
+                      e.currentTarget.style.borderColor = "#e2e8f0";
+                      e.currentTarget.style.background = "#f8fafc";
+                      const file = e.dataTransfer.files?.[0];
+                      if (file) handleImageSelect({ target: { files: [file] } });
+                    }}
+                    style={{ border: "2px dashed #e2e8f0", borderRadius: 12, padding: "16px", textAlign: "center", background: "#f8fafc", transition: "all 0.2s" }}>
+                    <p style={{ margin: 0, fontSize: 13, color: "#94a3b8" }}>📂 Ya yahan drag & drop karo</p>
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  {/* Image Preview */}
+                  <div style={{ position: "relative", marginBottom: 14 }}>
+                    <img src={imgPreview} alt="Uploaded document" style={{ width: "100%", maxHeight: 280, objectFit: "contain", borderRadius: 12, border: "1.5px solid #e2e8f0", background: "#f8fafc" }} />
+                    <button onClick={clearImage} style={{ position: "absolute", top: 8, right: 8, background: "rgba(0,0,0,0.55)", border: "none", color: "#fff", borderRadius: 8, padding: "4px 10px", fontSize: 12, cursor: "pointer", fontFamily: "inherit", fontWeight: 600 }}>✕ Remove</button>
+                  </div>
+
+                  {ocrError && <div style={{ marginBottom: 12, padding: "9px 14px", background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 8, color: "#dc2626", fontSize: 13 }}>⚠️ {ocrError}</div>}
+
+                  <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                    <label style={{ padding: "8px 16px", background: "#f1f5f9", border: "1px solid #e2e8f0", color: "#475569", borderRadius: 10, cursor: "pointer", fontSize: 13, fontFamily: "inherit", fontWeight: 600 }}>
+                      🖼️ Gallery
+                      <input type="file" accept="image/*" onChange={handleImageSelect} style={{ display: "none" }} />
+                    </label>
+                    <label style={{ padding: "8px 16px", background: "#f0fdf4", border: "1px solid #bbf7d0", color: "#059669", borderRadius: 10, cursor: "pointer", fontSize: 13, fontFamily: "inherit", fontWeight: 600 }}>
+                      📸 Camera
+                      <input type="file" accept="image/*" capture="environment" onChange={handleImageSelect} style={{ display: "none" }} />
+                    </label>
+                    <button onClick={handleOCR} disabled={ocrLoading} style={{
+                      marginLeft: "auto", padding: "9px 24px",
+                      background: ocrLoading ? "#94a3b8" : "linear-gradient(135deg,#2563eb,#0891b2)",
+                      border: "none", borderRadius: 10, color: "#fff", fontSize: 14,
+                      cursor: ocrLoading ? "not-allowed" : "pointer", fontFamily: "inherit", fontWeight: 700,
+                      boxShadow: ocrLoading ? "none" : "0 4px 14px rgba(37,99,235,0.35)",
+                      display: "flex", alignItems: "center", gap: 8,
+                    }}>
+                      {ocrLoading ? (
+                        <><span style={{ display: "inline-block", animation: "spin 1s linear infinite" }}>⟳</span> Reading Image...</>
+                      ) : "🔍 Read & Extract Text"}
+                    </button>
+                  </div>
+
+                  {ocrLoading && (
+                    <div style={{ marginTop: 14, padding: "12px 16px", background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 10, fontSize: 13, color: "#1e40af", display: "flex", alignItems: "center", gap: 10 }}>
+                      <span style={{ fontSize: 20, display: "inline-block", animation: "spin 1s linear infinite" }}>⟳</span>
+                      AI image padh raha hai... thoda wait karo 🏥
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Extracted text preview (after OCR) */}
+        {rawText && inputMode === "image" && (
+          <div style={{ background: "#fff", borderRadius: 16, boxShadow: "0 4px 16px rgba(0,0,0,0.07)", padding: 22, marginBottom: 22, border: "1px solid #bbf7d0" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
+              <div>
+                <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: "#059669", textTransform: "uppercase", letterSpacing: "0.04em" }}>✅ Text Extracted from Image</h3>
+                <p style={{ margin: "2px 0 0", fontSize: 12, color: "#94a3b8" }}>Review karo phir Parse karo</p>
+              </div>
+              <button onClick={handleParse} style={{ padding: "8px 22px", background: "linear-gradient(135deg,#059669,#0891b2)", border: "none", borderRadius: 10, color: "#fff", fontSize: 13, cursor: "pointer", fontFamily: "inherit", fontWeight: 700, boxShadow: "0 4px 12px rgba(5,150,105,0.35)" }}>
+                🔍 Parse & Simplify
+              </button>
+            </div>
+            <textarea value={rawText} onChange={e => setRawText(e.target.value)}
+              style={{ width: "100%", height: 160, background: "#f0fdf4", border: "1.5px solid #bbf7d0", borderRadius: 10, color: "#334155", padding: "12px 14px", fontSize: 13, fontFamily: "monospace", resize: "vertical", outline: "none", lineHeight: 1.6, boxSizing: "border-box" }} />
+          </div>
+        )}
+
+        {/* Results */}
+        {results && (
+          <div style={{ background: "#fff", borderRadius: 18, boxShadow: "0 4px 24px rgba(0,0,0,0.08)", border: "1px solid #e2e8f0", overflow: "hidden" }}>
+            <div style={{ padding: "13px 20px", background: "#f8fafc", borderBottom: "1px solid #e2e8f0", display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+              <input value={search} onChange={e => setSearch(e.target.value)} placeholder="🔎 Search within results..."
+                style={{ flex: 1, minWidth: 160, padding: "7px 13px", border: "1.5px solid #e2e8f0", borderRadius: 8, fontSize: 13, fontFamily: "inherit", outline: "none", background: "#fff", color: "#334155" }} />
+              <button onClick={copyAll} style={{ padding: "7px 14px", background: copied ? "#d1fae5" : "#f0fdf4", border: `1px solid ${copied ? "#6ee7b7" : "#bbf7d0"}`, color: copied ? "#059669" : "#16a34a", borderRadius: 8, cursor: "pointer", fontSize: 13, fontFamily: "inherit", fontWeight: 600 }}>
+                {copied ? "✓ Copied!" : "📋 Copy All"}
+              </button>
+              <button onClick={handlePrint} style={{ padding: "7px 14px", background: "#eff6ff", border: "1px solid #bfdbfe", color: "#2563eb", borderRadius: 8, cursor: "pointer", fontSize: 13, fontFamily: "inherit", fontWeight: 600 }}>🖨️ Print</button>
+            </div>
+
+            <div style={{ display: "flex", overflowX: "auto", borderBottom: "1px solid #e2e8f0" }}>
+              {SECTIONS.map(s => (
+                <button key={s.key} onClick={() => { setActiveTab(s.key); setSearch(""); }} style={{
+                  padding: "12px 17px", border: "none", borderBottom: activeTab === s.key ? `3px solid ${s.color}` : "3px solid transparent",
+                  background: activeTab === s.key ? `${s.color}11` : "transparent",
+                  color: activeTab === s.key ? s.color : "#64748b",
+                  cursor: "pointer", fontSize: 13, whiteSpace: "nowrap", fontFamily: "inherit", fontWeight: activeTab === s.key ? 700 : 500,
+                }}>
+                  {s.icon} {s.label}
+                  <span style={{ marginLeft: 5, padding: "1px 7px", borderRadius: 10, fontSize: 11, background: activeTab === s.key ? s.color : "#f1f5f9", color: activeTab === s.key ? "#fff" : "#94a3b8", fontWeight: 700 }}>
+                    {results[s.key].length}
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            <div style={{ padding: "22px 26px", minHeight: 180 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+                <div style={{ width: 40, height: 40, borderRadius: 12, background: `${activeSection.color}18`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, border: `2px solid ${activeSection.color}33` }}>
+                  {activeSection.icon}
+                </div>
+                <div style={{ flex: 1 }}>
+                  <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: "#1e293b" }}>{activeSection.label}</h3>
+                  <p style={{ margin: 0, fontSize: 12, color: "#94a3b8" }}>{filteredLines.length} item(s)</p>
+                </div>
+                <div style={{ fontSize: 11, color: "#94a3b8", fontStyle: "italic", textAlign: "right", lineHeight: 1.5 }}>💡 Line pe click karo<br/>AI + 🔊 voice milega</div>
+              </div>
+
+              {filteredLines.length > 0 ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {filteredLines.map((line, i) => (
+                    <div key={i} onClick={() => { setSelectedTerm(cleanLine(line)); setShowAI(true); }} title="Click → AI explain + voice"
+                      style={{ background: activeTab === "warnings" ? "#fffbeb" : `${activeSection.color}09`, border: `1px solid ${activeSection.color}28`, borderLeft: `4px solid ${activeSection.color}`, borderRadius: 10, padding: "10px 15px", fontSize: 14, color: "#334155", lineHeight: 1.75, cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}
+                      onMouseEnter={e => { e.currentTarget.style.background = `${activeSection.color}18`; e.currentTarget.style.boxShadow = `0 2px 10px ${activeSection.color}22`; }}
+                      onMouseLeave={e => { e.currentTarget.style.background = activeTab === "warnings" ? "#fffbeb" : `${activeSection.color}09`; e.currentTarget.style.boxShadow = "none"; }}>
+                      <span>{line.startsWith("-") ? "• " + cleanLine(line) : line}</span>
+                      <span style={{ fontSize: 17, flexShrink: 0, opacity: 0.4 }}>🔊</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={{ textAlign: "center", padding: "40px 20px", color: "#94a3b8" }}>
+                  <div style={{ fontSize: 32, marginBottom: 8 }}>🔍</div>
+                  <p style={{ margin: 0, fontSize: 14 }}>No information found for this section.</p>
+                </div>
+              )}
+            </div>
+
+            <div style={{ padding: "11px 22px", background: "#f8fafc", borderTop: "1px solid #e2e8f0", display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+              {SECTIONS.map(s => (
+                <span key={s.key} style={{ fontSize: 12, color: results[s.key].length > 0 ? s.color : "#cbd5e1", fontWeight: results[s.key].length > 0 ? 600 : 400 }}>
+                  {s.icon} {results[s.key].length}
+                </span>
+              ))}
+              <span style={{ marginLeft: "auto", fontSize: 11, color: "#94a3b8", fontStyle: "italic" }}>Always consult your doctor</span>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <style>{`
+        * { box-sizing: border-box; }
+        button { transition: opacity 0.15s, transform 0.1s; }
+        button:hover { opacity: 0.87; }
+        button:active { transform: scale(0.97); }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        ::-webkit-scrollbar { height: 5px; width: 5px; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        textarea::placeholder, input::placeholder { color: #94a3b8; }
+      `}</style>
+    </div>
+  );
+}
+
+function StatBadge({ label, value, color }) {
+  return (
+    <div style={{ background: "rgba(255,255,255,0.1)", borderRadius: 10, padding: "5px 13px", textAlign: "center", minWidth: 58 }}>
+      <div style={{ fontSize: 16, fontWeight: 800, color, lineHeight: 1 }}>{value}</div>
+      <div style={{ fontSize: 10, color: "rgba(255,255,255,0.55)", marginTop: 2, textTransform: "uppercase", letterSpacing: "0.05em" }}>{label}</div>
+    </div>
+  );
+}
